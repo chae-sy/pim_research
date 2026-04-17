@@ -1,0 +1,6 @@
+[submodule "external/dramsim3"]
+	path = external/dramsim3
+	url = git@github.com:umd-memsys/DRAMsim3.git
+[submodule "external/ramulator2"]
+	path = external/ramulator2
+	url = git@github.com:CMU-SAFARI/ramulator2.git
