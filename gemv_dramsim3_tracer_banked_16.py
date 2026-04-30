@@ -37,7 +37,7 @@ def align_up(x: int, align: int) -> int:
 
 BASE = 0x100000000000
 
-# DDR4_8Gb_x16_3200 configuration
+# DDR4_8Gb_x16_3200
 def encode_addr(ro: int, ra: int, bg: int, ba: int, co: int) -> int:
     return (
         BASE
@@ -335,6 +335,7 @@ class GemvTracer:
         bankgroups: int,
         banks_per_group: int,
         a_layout: str,
+        num_gemv: int,
     ):
         if row_bytes % burst_bytes != 0:
             raise ValueError("row_bytes must be a multiple of burst_bytes")
@@ -352,6 +353,8 @@ class GemvTracer:
         self.total_banks = bankgroups * banks_per_group
         self.a_layout = a_layout
 
+        self.num_gemv = num_gemv
+
         self.elems_per_burst = burst_bytes // elem_bytes
         if self.elems_per_burst <= 0:
             raise ValueError("burst_bytes must be >= elem_bytes")
@@ -362,31 +365,29 @@ class GemvTracer:
         self.time = 0
         self.trace: List[TraceReq] = []
 
-        self._alloc_tensors()
+        self.x_bases = []
+        self.y_bases = []
+        self.a_layouts = []
 
-    def _alloc_tensors(self) -> None:
-        x_bytes = self.k * self.elem_bytes
-        y_bytes = self.m * self.elem_bytes
+        for g in range(self.num_gemv):
+            x_base = encode_addr(ro=0, ra=1, bg=0, ba=g%8, co=0) # to fix
+            y_base = encode_addr(ro=0, ra=1, bg=0, ba=g%8, co=48) # to fix
 
-        # A는 별도 bank-aware layout 객체가 관리
-        self.a_matrix_layout = BankedAMatrixLayout(
-            addr=self.addr,
-            m=self.m,
-            k=self.k,
-            elem_bytes=self.elem_bytes,
-            burst_bytes=self.burst_bytes,
-            row_bytes=self.row_bytes,
-            bankgroups=self.bankgroups,
-            banks_per_group=self.banks_per_group,
-            layout_mode=self.a_layout,
-        )
+            self.x_bases.append(x_base)
+            self.y_bases.append(y_base)
 
-        # to fix
-        self.addr.map["x"] = encode_addr(ro=0, ra=1, bg=0, ba=0, co=0)
-        self.addr.size_map["x"] = x_bytes
-
-        self.addr.map["y"] = encode_addr(ro=0, ra=1, bg=0, ba=0, co=48)
-        self.addr.size_map["y"] = y_bytes
+            a_layout = BankedAMatrixLayout(
+                addr=self.addr,
+                m=self.m,
+                k=self.k,
+                elem_bytes=self.elem_bytes,
+                burst_bytes=self.burst_bytes,
+                row_bytes=self.row_bytes,
+                bankgroups=self.bankgroups,
+                banks_per_group=self.banks_per_group,
+                layout_mode=self.a_layout,
+            )
+            self.a_layouts.append(a_layout)
 
     def _emit(self, op: str, addr: int, tensor: str, logical_offset: int, meta: Dict) -> None:
         row_base = (addr // self.row_bytes) * self.row_bytes
@@ -428,85 +429,65 @@ class GemvTracer:
                 meta=meta,
             )
 
-    def generate(self) -> List[TraceReq]:
-        x_base = self.addr.get("x")
-        y_base = self.addr.get("y")
-
+    def generate(self):
         k_bytes = self.k * self.elem_bytes
         bursts_per_dot = ceil_div(k_bytes, self.burst_bytes)
 
-        if self.reuse_x == "global":
-            self._emit_tensor_span(
-                op="READ",
-                tensor="x",
-                base=x_base,
-                offset_bytes=0,
-                span_bytes=k_bytes,
-                meta={"stage": "x_preload_global", "k": self.k},
-            )
+        for g in range(self.num_gemv):   # 🔥 추가
+            x_base = self.x_bases[g]
+            y_base = self.y_bases[g]
+            a_layout = self.a_layouts[g]
 
-        for i in range(self.m):
-            for c in range(bursts_per_dot):
-                burst_off = c * self.burst_bytes
-                a_info = self.a_matrix_layout.get_a_access_info(i, c)
+            for i in range(self.m):
+                for c in range(bursts_per_dot):
+                    burst_off = c * self.burst_bytes
+                    a_info = a_layout.get_a_access_info(i, c)
 
-                self._emit(
-                    op="READ",
-                    addr=a_info["addr"],
-                    tensor="A",
-                    logical_offset=a_info["logical_offset"],
-                    meta={
-                        "stage": "gemv",
-                        "row": i,
-                        "burst_chunk": c,
-                        "operand": "A",
-                        "a_layout": self.a_layout,
-                        "bankgroup": a_info["bankgroup"],
-                        "bank": a_info["bank"],
-                        "bank_id": a_info["bank_id"],
-                        "physical_shard_name": a_info["physical_shard_name"],
-                        "physical_shard_offset": a_info["physical_shard_offset"],
-                    },
-                )
+                    self._emit(
+                        op="READ",
+                        addr=a_info["addr"],
+                        tensor=f"A{g}",   # 구분
+                        logical_offset=a_info["logical_offset"],
+                        meta={
+                            "gemv_id": g,   # 🔥 추가
+                            "row": i,
+                            "burst_chunk": c,
+                            "operand": "A",
+                        },
+                    )
 
-                need_x_read = (
-                    self.reuse_x == "none" or
-                    self.reuse_x == "per_row" or
-                    (self.reuse_x == "global" and i == 0 and False)
-                )
-
-                if need_x_read:
                     self._emit(
                         op="READ",
                         addr=x_base + burst_off,
-                        tensor="x",
+                        tensor=f"x{g}",
                         logical_offset=burst_off,
                         meta={
-                            "stage": "gemv",
+                            "gemv_id": g,
                             "row": i,
                             "burst_chunk": c,
                             "operand": "x",
                         },
                     )
 
-            y_elem_off = i * self.elem_bytes
-            self._emit_tensor_span(
-                op="WRITE",
-                tensor="y",
-                base=y_base,
-                offset_bytes=y_elem_off,
-                span_bytes=self.elem_bytes,
-                meta={
-                    "stage": "store_output",
-                    "row": i,
-                },
-            )
+                # y write
+                y_elem_off = i * self.elem_bytes
+                self._emit_tensor_span(
+                    op="WRITE",
+                    tensor=f"y{g}",
+                    base=y_base,
+                    offset_bytes=y_elem_off,
+                    span_bytes=self.elem_bytes,
+                    meta={
+                        "gemv_id": g,
+                        "row": i,
+                    },
+                )
 
         return self.trace
 
     def summary(self) -> Dict:
-        x_bytes = self.addr.size("x")
-        y_bytes = self.addr.size("y")
+        x_bytes = self.k * self.elem_bytes
+        y_bytes = self.m * self.elem_bytes
 
         row_payload_bytes = self.k * self.elem_bytes
         bursts_per_dot = ceil_div(row_payload_bytes, self.burst_bytes)
@@ -536,10 +517,31 @@ class GemvTracer:
                 "total_banks": self.total_banks,
             },
             "tensor_layout": {
-                "A": self.a_matrix_layout.summary(),
-                "x": {"base": hex(self.addr.get("x")), "bytes": x_bytes},
-                "y": {"base": hex(self.addr.get("y")), "bytes": y_bytes},
-            },
+                    "num_gemv": self.num_gemv,
+                    "A": [
+                        {
+                            "gemv_id": g,
+                            "layout": self.a_layouts[g].summary(),
+                        }
+                        for g in range(self.num_gemv)
+                    ],
+                    "x": [
+                        {
+                            "gemv_id": g,
+                            "base": hex(self.x_bases[g]),
+                            "bytes": x_bytes,
+                        }
+                        for g in range(self.num_gemv)
+                    ],
+                    "y": [
+                        {
+                            "gemv_id": g,
+                            "base": hex(self.y_bases[g]),
+                            "bytes": y_bytes,
+                        }
+                        for g in range(self.num_gemv)
+                    ],
+                },
             "access_pattern": {
                 "reuse_x": self.reuse_x,
                 "a_layout": self.a_layout,
@@ -590,8 +592,9 @@ def parse_args():
             "'global' = preload x once, then do not issue more x DRAM reads."
         ),
     )
+    p.add_argument("--num_gemv", type=int, default=1)
     p.add_argument("--out-dir", type=Path, default=Path("./gemv_trace_out"))
-    p.add_argument("--prefix", type=str, default="gemv_32x1536_fp16_b64_banked_new")
+    p.add_argument("--prefix", type=str, default="gemv_32x1536_fp16_b64_banked_16_new")
     return p.parse_args()
 
 
@@ -611,6 +614,7 @@ def main():
         bankgroups=args.bankgroups,
         banks_per_group=args.banks_per_group,
         a_layout=args.a_layout,
+        num_gemv=args.num_gemv,
     )
     trace = tracer.generate()
 
